@@ -1,0 +1,6 @@
+{% extends 'base.html' %}
+{% block title %}Rijoya — Products{% endblock %}
+{% block content %}
+<section class="section-heading"><div><p class="eyebrow">PRODUCTS</p><h1>Add something good.</h1></div>{% if session.get('vendor_name') %}<span class="tag">Vendor: {{ session.get('vendor_name') }}</span>{% endif %}</section>
+<div class="two-column"><section class="soft-panel"><h2>Upload a product</h2><form method="post" class="form-card"><label>Product name<input type="text" name="name" placeholder="Handmade bowl" required></label><label>Price<input type="number" name="price" step="0.01" min="0" placeholder="24.00" required></label><button class="button" type="submit">Add product</button></form>{% if not session.get('vendor_id') %}<p class="hint">Register as a vendor first to upload products.</p>{% endif %}</section><section><h2>Catalog</h2><div class="list">{% for product in products %}<div class="list-row"><div><strong>{{ product.name }}</strong><small>{{ product.vendor_name }}</small></div><strong>${{ '%.2f'|format(product.price) }}</strong></div>{% else %}<p>No products yet.</p>{% endfor %}</div></section></div>
+{% endblock %}

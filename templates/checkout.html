@@ -1,0 +1,5 @@
+{% extends 'base.html' %}
+{% block title %}Rijoya — Checkout{% endblock %}
+{% block content %}
+<div class="checkout-layout"><section><p class="eyebrow">CHECKOUT</p><h1>Confirm your order.</h1><p class="lead">This beginner-friendly MVP records a confirmed order without charging a real payment method.</p><form method="post" class="form-card"><label>Delivery name<input type="text" name="name" value="{{ current_user }}" required></label><label>Delivery address<textarea name="address" rows="4" placeholder="123 Maker Street" required></textarea></label><button class="button" type="submit">Confirm order</button></form></section><aside class="summary"><h2>Order summary</h2>{% for item in items %}<div><span>{{ item.name }}</span><strong>${{ '%.2f'|format(item.price) }}</strong></div>{% endfor %}<hr><div><strong>Total</strong><strong>${{ '%.2f'|format(total) }}</strong></div></aside></div>
+{% endblock %}

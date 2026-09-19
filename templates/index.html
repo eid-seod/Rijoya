@@ -1,0 +1,7 @@
+{% extends 'base.html' %}
+{% block title %}Rijoya — Home{% endblock %}
+{% block content %}
+<section class="hero"><p class="eyebrow">THE GOOD EDIT</p><h1>Made by<br><span>someone.</span></h1><p class="lead">A simple marketplace for thoughtful goods, small-batch finds, and the people who make them.</p><a class="button" href="#products">Shop products ↓</a></section>
+<section id="products" class="section-heading"><div><p class="eyebrow">THE CATALOG</p><h2>Find something good.</h2></div><a href="{{ url_for('products') }}">See all products →</a></section>
+<div class="product-grid">{% for product in products %}<article class="product-card"><div class="product-image">{{ product.name[0] }}</div><p class="eyebrow">{{ product.vendor_name }}</p><h3>{{ product.name }}</h3><div class="product-bottom"><strong>${{ '%.2f'|format(product.price) }}</strong><form method="post" action="{{ url_for('add_to_cart', product_id=product.id) }}"><button class="small-button" type="submit">Add</button></form></div></article>{% else %}<p>No products yet. Register as a vendor to add one.</p>{% endfor %}</div>
+{% endblock %}
