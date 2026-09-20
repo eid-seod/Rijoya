@@ -80,3 +80,8 @@ footer { border-top: 1px solid var(--line); padding: 30px 6%; color: var(--muted
 select { border: 1px solid #cfcac0; border-radius: 8px; padding: 9px; background: white; color: var(--ink); }
 .danger-button { border: 0; border-radius: 999px; padding: 9px 13px; background: #f5d6cc; color: #9b3926; cursor: pointer; font-weight: bold; }
 @media (max-width: 900px) { .admin-row { grid-template-columns: 1fr; } .action-group { justify-content: start; } .stats-grid { grid-template-columns: 1fr; } .admin-header { align-items: start; flex-direction: column; } .inline-form { flex-wrap: wrap; } }
+
+.admin-create-form { flex-wrap: wrap; }
+.admin-create-form input { flex: 1; min-width: 170px; }
+.action-group select[multiple] { min-width: 140px; min-height: 82px; }
+code { background: #ebe8df; border-radius: 5px; padding: 2px 5px; }
