@@ -1,5 +1,0 @@
-{% extends 'base.html' %}
-{% block title %}Rijoya — Login{% endblock %}
-{% block content %}
-<div class="auth-grid"><section><p class="eyebrow">WELCOME BACK</p><h1>Login to Rijoya.</h1><form method="post" class="form-card"><input type="hidden" name="action" value="login"><label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="button" type="submit">Log in</button></form><p class="hint">Demo Super Admin: <strong>admin@rijoya.local</strong> / <strong>admin123</strong></p><p class="hint">API clients can use <code>POST /api/auth/login</code> to receive a JWT.</p></section><section class="soft-panel"><p class="eyebrow">NEW HERE?</p><h2>Create an account.</h2><form method="post" class="form-card"><input type="hidden" name="action" value="register"><label>Name<input type="text" name="name" required></label><label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required minlength="6"></label><button class="button light" type="submit">Register</button></form></section></div>
-{% endblock %}
