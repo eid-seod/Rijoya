@@ -1,15 +1,20 @@
-DROP TABLE IF EXISTS user_permissions;
-DROP TABLE IF EXISTS role_permissions;
+DROP TABLE IF EXISTS support_tickets;
+DROP TABLE IF EXISTS payments;
+DROP TABLE IF EXISTS addresses;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS order_items;
 DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS products;
 DROP TABLE IF EXISTS vendors;
+DROP TABLE IF EXISTS user_permissions;
+DROP TABLE IF EXISTS role_permissions;
 DROP TABLE IF EXISTS users;
 DROP TABLE IF EXISTS permissions;
 DROP TABLE IF EXISTS roles;
 
 CREATE TABLE roles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE
+    name TEXT NOT NULL UNIQUE CHECK (name IN ('super_admin', 'admin', 'vendor', 'customer'))
 );
 
 CREATE TABLE permissions (
@@ -20,12 +25,22 @@ CREATE TABLE permissions (
 
 CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
+    username TEXT NOT NULL UNIQUE,
     email TEXT NOT NULL UNIQUE,
-    password TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
     role_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended')),
+    created_at TEXT NOT NULL,
     FOREIGN KEY (role_id) REFERENCES roles (id)
+);
+
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    login_time TEXT NOT NULL,
+    last_activity TEXT NOT NULL,
+    ip_address TEXT,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
 CREATE TABLE role_permissions (
@@ -46,12 +61,11 @@ CREATE TABLE user_permissions (
 
 CREATE TABLE vendors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
+    user_id INTEGER NOT NULL UNIQUE,
+    store_name TEXT NOT NULL UNIQUE,
     email TEXT NOT NULL UNIQUE,
-    products TEXT DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
-    owner_user_id INTEGER,
-    FOREIGN KEY (owner_user_id) REFERENCES users (id) ON DELETE SET NULL
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
 CREATE TABLE products (
@@ -60,54 +74,86 @@ CREATE TABLE products (
     price REAL NOT NULL CHECK (price >= 0),
     vendor_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
-    FOREIGN KEY (vendor_id) REFERENCES vendors (id)
+    FOREIGN KEY (vendor_id) REFERENCES vendors (id) ON DELETE CASCADE
 );
 
 CREATE TABLE orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    product_id INTEGER NOT NULL,
+    customer_id INTEGER NOT NULL,
+    total_amount REAL NOT NULL CHECK (total_amount >= 0),
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'processing', 'shipped', 'completed', 'cancelled')),
-    FOREIGN KEY (user_id) REFERENCES users (id),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (customer_id) REFERENCES users (id)
+);
+
+CREATE TABLE order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
+    price REAL NOT NULL CHECK (price >= 0),
+    FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE,
     FOREIGN KEY (product_id) REFERENCES products (id)
+);
+
+CREATE TABLE payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    amount REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE
+);
+
+CREATE TABLE addresses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    address TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE TABLE support_tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'in_progress', 'closed')),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
 INSERT INTO roles (name) VALUES ('super_admin'), ('admin'), ('vendor'), ('customer');
 
 INSERT INTO permissions (name, description) VALUES
     ('view_dashboard', 'View administration dashboard'),
-    ('manage_vendors', 'Approve, reject, edit, and delete vendors'),
-    ('manage_products', 'Approve, reject, edit, and delete products'),
-    ('manage_orders', 'Monitor and update orders'),
-    ('manage_payments', 'Manage payment settings and records'),
-    ('view_analytics', 'View analytics and performance reports'),
-    ('manage_settings', 'Change system-wide settings'),
-    ('manage_own_products', 'Manage products owned by the vendor'),
-    ('manage_own_orders', 'View and manage orders for the vendor');
+    ('manage_vendors', 'Manage all vendors'),
+    ('manage_products', 'Manage all products'),
+    ('manage_orders', 'Manage all orders'),
+    ('manage_customers', 'View all customer accounts'),
+    ('manage_support', 'Manage customer support tickets'),
+    ('manage_payments', 'Manage payments'),
+    ('view_analytics', 'View reports and analytics'),
+    ('manage_settings', 'Manage system settings'),
+    ('manage_own_products', 'Manage own products'),
+    ('manage_own_orders', 'View and manage own orders');
 
 INSERT INTO role_permissions (role_id, permission_id)
 SELECT roles.id, permissions.id FROM roles, permissions
-WHERE roles.name = 'admin' AND permissions.name IN ('view_dashboard', 'manage_vendors', 'manage_products', 'manage_orders', 'view_analytics');
-
+WHERE roles.name = 'admin' AND permissions.name IN ('view_dashboard', 'manage_vendors', 'manage_products', 'manage_orders', 'manage_customers', 'manage_support', 'view_analytics');
 INSERT INTO role_permissions (role_id, permission_id)
 SELECT roles.id, permissions.id FROM roles, permissions
 WHERE roles.name = 'vendor' AND permissions.name IN ('manage_own_products', 'manage_own_orders');
 
-INSERT INTO role_permissions (role_id, permission_id)
-SELECT roles.id, permissions.id FROM roles, permissions
-WHERE roles.name = 'customer' AND permissions.name = 'view_dashboard' AND 1 = 0;
+INSERT INTO users (username, email, password_hash, role_id, status, created_at) VALUES
+    ('Demo Customer', 'demo@rijoya.local', 'demo-password', (SELECT id FROM roles WHERE name = 'customer'), 'active', '2026-01-01T00:00:00+00:00'),
+    ('Rijoya Super Admin', 'admin@rijoya.local', 'admin123', (SELECT id FROM roles WHERE name = 'super_admin'), 'active', '2026-01-01T00:00:00+00:00'),
+    ('Rijoya Admin', 'ops@rijoya.local', 'admin123', (SELECT id FROM roles WHERE name = 'admin'), 'active', '2026-01-01T00:00:00+00:00'),
+    ('Mara Studio', 'vendor@rijoya.local', 'vendor123', (SELECT id FROM roles WHERE name = 'vendor'), 'active', '2026-01-01T00:00:00+00:00');
 
-INSERT INTO vendors (name, email, products, status) VALUES
-    ('Mara Studio', 'hello@marastudio.example', 'Arc desk lamp', 'approved'),
-    ('Woven North', 'hello@wovennorth.example', 'Field notes tote', 'approved');
+INSERT INTO vendors (user_id, store_name, email, status) VALUES
+    ((SELECT id FROM users WHERE email = 'vendor@rijoya.local'), 'Mara Studio', 'vendor@rijoya.local', 'approved');
 
 INSERT INTO products (name, price, vendor_id, status) VALUES
     ('Arc Desk Lamp', 84.00, 1, 'approved'),
-    ('Field Notes Tote', 46.00, 2, 'approved'),
-    ('Cedar + Smoke Candle', 28.00, 1, 'approved'),
-    ('Alba Ceramic Mug', 32.00, 1, 'approved');
-
-INSERT INTO users (name, email, password, role_id, status) VALUES
-    ('Demo Customer', 'demo@rijoya.local', 'demo-password', (SELECT id FROM roles WHERE name = 'customer'), 'active'),
-    ('Rijoya Super Admin', 'admin@rijoya.local', 'admin123', (SELECT id FROM roles WHERE name = 'super_admin'), 'active'),
-    ('Rijoya Admin', 'ops@rijoya.local', 'admin123', (SELECT id FROM roles WHERE name = 'admin'), 'active');
+    ('Cedar + Smoke Candle', 28.00, 1, 'approved');

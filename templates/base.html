@@ -14,7 +14,7 @@
       <a href="{{ url_for('products') }}">Products</a>
       <a href="{{ url_for('vendor_register') }}">Sell on Rijoya</a>
       <a href="{{ url_for('cart') }}">Cart ({{ cart_count }})</a>
-      {% if current_user %}<span class="welcome">Hi, {{ current_user }}</span>{% if is_admin %}<a href="{{ url_for('admin_dashboard') }}">Admin</a>{% elif is_vendor %}<a href="{{ url_for('vendor_dashboard') }}">Vendor portal</a>{% endif %}<a href="{{ url_for('logout') }}">Log out</a>{% else %}<a href="{{ url_for('auth') }}">Login / Register</a>{% endif %}
+      {% if current_user %}<span class="welcome">Hi, {{ current_user }}</span>{% if is_admin %}<a href="{{ url_for('admin_dashboard') }}">Admin</a>{% elif is_vendor %}<a href="{{ url_for('vendor_dashboard') }}">Vendor portal</a>{% else %}<a href="{{ url_for('customer_dashboard') }}">My account</a>{% endif %}<a href="{{ url_for('logout') }}">Log out</a>{% else %}<a href="{{ url_for('auth') }}">Login / Register</a>{% endif %}
     </nav>
   </header>
   <main class="container">

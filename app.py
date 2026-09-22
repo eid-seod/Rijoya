@@ -1,22 +1,31 @@
 from pathlib import Path
 import os
+import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
-import jwt
 from flask import Flask, flash, g, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = BASE_DIR / "rijoya.db"
 SCHEMA = BASE_DIR / "schema.sql"
+SESSION_TIMEOUT_MINUTES = 30
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "change-this-secret-key")
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", app.config["SECRET_KEY"])
-app.config["DATABASE"] = DATABASE
-JWT_EXPIRY_HOURS = 8
+app.config.update(
+    SECRET_KEY=os.getenv("FLASK_SECRET_KEY", "change-this-secret-key"),
+    DATABASE=DATABASE,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "0") == "1",
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=SESSION_TIMEOUT_MINUTES),
+)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def get_db():
@@ -33,9 +42,10 @@ def database_needs_initialization():
     if not Path(app.config["DATABASE"]).exists():
         return True
     db = sqlite3.connect(app.config["DATABASE"])
-    table = db.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'roles'").fetchone()
+    required = {"users", "sessions", "order_items", "addresses"}
+    existing = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
     db.close()
-    return table is None
+    return not required.issubset(existing)
 
 
 @app.teardown_appcontext
@@ -53,11 +63,9 @@ def init_db():
         "demo@rijoya.local": "demo-password",
         "admin@rijoya.local": "admin123",
         "ops@rijoya.local": "admin123",
+        "vendor@rijoya.local": "vendor123",
     }.items():
-        db.execute(
-            "UPDATE users SET password = ?, status = 'active' WHERE email = ?",
-            (generate_password_hash(password), email),
-        )
+        db.execute("UPDATE users SET password_hash = ?, status = 'active' WHERE email = ?", (generate_password_hash(password), email))
     db.commit()
     db.close()
 
@@ -67,58 +75,71 @@ def role_id(name):
     return row["id"]
 
 
-def create_access_token(user):
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": str(user["id"]),
-        "role": user["role_name"],
-        "iat": now,
-        "exp": now + timedelta(hours=JWT_EXPIRY_HOURS),
-    }
-    return jwt.encode(payload, app.config["JWT_SECRET_KEY"], algorithm="HS256")
+def find_user(email):
+    return get_db().execute(
+        "SELECT users.*, roles.name AS role_name FROM users JOIN roles ON roles.id = users.role_id WHERE users.email = ?",
+        (email,),
+    ).fetchone()
 
 
-def bearer_token():
-    header = request.headers.get("Authorization", "")
-    if header.lower().startswith("bearer "):
-        return header.split(" ", 1)[1].strip()
-    return session.get("access_token")
+def permissions_for(user):
+    db = get_db()
+    permissions = {row["name"] for row in db.execute(
+        "SELECT permissions.name FROM permissions JOIN role_permissions ON role_permissions.permission_id = permissions.id WHERE role_permissions.role_id = ?",
+        (user["role_id"],),
+    ).fetchall()}
+    permissions.update(row["name"] for row in db.execute(
+        "SELECT permissions.name FROM permissions JOIN user_permissions ON user_permissions.permission_id = permissions.id WHERE user_permissions.user_id = ?",
+        (user["id"],),
+    ).fetchall())
+    return {"*"} if user["role_name"] == "super_admin" else permissions
 
 
-def current_identity():
+def identity_from_session():
     if hasattr(g, "identity"):
         return g.identity
-    token = bearer_token()
-    if not token:
+    user_id = session.get("user_id")
+    session_id = session.get("session_id")
+    if not user_id or not session_id:
+        g.identity = None
+        return None
+    db = get_db()
+    active = db.execute(
+        "SELECT sessions.*, users.status FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.id = ? AND sessions.user_id = ?",
+        (session_id, user_id),
+    ).fetchone()
+    if not active or active["status"] != "active":
+        session.clear()
+        g.identity = None
         return None
     try:
-        claims = jwt.decode(token, app.config["JWT_SECRET_KEY"], algorithms=["HS256"])
-        user = get_db().execute(
-            "SELECT users.*, roles.name AS role_name FROM users JOIN roles ON roles.id = users.role_id "
-            "WHERE users.id = ? AND users.status = 'active'",
-            (int(claims["sub"]),),
-        ).fetchone()
-        if not user:
-            return None
-        permissions = {row["name"] for row in get_db().execute(
-            "SELECT permissions.name FROM permissions "
-            "JOIN role_permissions ON role_permissions.permission_id = permissions.id "
-            "WHERE role_permissions.role_id = ?",
-            (user["role_id"],),
-        ).fetchall()}
-        permissions.update(row["name"] for row in get_db().execute(
-            "SELECT permissions.name FROM permissions "
-            "JOIN user_permissions ON user_permissions.permission_id = permissions.id "
-            "WHERE user_permissions.user_id = ?",
-            (user["id"],),
-        ).fetchall())
-        if user["role_name"] == "super_admin":
-            permissions = {"*"}
-        vendor = get_db().execute("SELECT id, name, status FROM vendors WHERE owner_user_id = ?", (user["id"],)).fetchone()
-        g.identity = {"user": user, "role": user["role_name"], "permissions": permissions, "vendor": vendor}
-    except (jwt.InvalidTokenError, ValueError, TypeError, KeyError):
+        last_activity = datetime.fromisoformat(active["last_activity"])
+    except ValueError:
+        last_activity = datetime.now(timezone.utc) - timedelta(minutes=SESSION_TIMEOUT_MINUTES + 1)
+    if datetime.now(timezone.utc) - last_activity > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
+        db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        db.commit()
+        session.clear()
         g.identity = None
+        return None
+    user = db.execute(
+        "SELECT users.*, roles.name AS role_name FROM users JOIN roles ON roles.id = users.role_id WHERE users.id = ? AND users.status = 'active'",
+        (user_id,),
+    ).fetchone()
+    if not user:
+        session.clear()
+        g.identity = None
+        return None
+    db.execute("UPDATE sessions SET last_activity = ? WHERE id = ?", (utc_now(), session_id))
+    db.commit()
+    vendor = db.execute("SELECT * FROM vendors WHERE user_id = ?", (user_id,)).fetchone()
+    g.identity = {"user": user, "role": user["role_name"], "permissions": permissions_for(user), "vendor": vendor, "session": active}
     return g.identity
+
+
+def current_user():
+    identity = identity_from_session()
+    return identity["user"] if identity else None
 
 
 def is_api_request():
@@ -129,7 +150,7 @@ def unauthorized():
     if is_api_request():
         return jsonify(error="Authentication required"), 401
     flash("Please log in first.", "error")
-    return redirect(url_for("auth"))
+    return redirect(url_for("auth", next=request.path))
 
 
 def forbidden(message="You do not have permission to perform this action."):
@@ -139,10 +160,10 @@ def forbidden(message="You do not have permission to perform this action."):
     return redirect(request.referrer or url_for("home"))
 
 
-def auth_required(view):
+def login_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if not current_identity():
+        if not identity_from_session():
             return unauthorized()
         return view(*args, **kwargs)
     return wrapped
@@ -152,7 +173,7 @@ def role_required(*roles):
     def decorator(view):
         @wraps(view)
         def wrapped(*args, **kwargs):
-            identity = current_identity()
+            identity = identity_from_session()
             if not identity:
                 return unauthorized()
             if identity["role"] == "super_admin" or identity["role"] in roles:
@@ -162,11 +183,23 @@ def role_required(*roles):
     return decorator
 
 
+def admin_required(view):
+    return role_required("admin", "super_admin")(view)
+
+
+def super_admin_required(view):
+    return role_required("super_admin")(view)
+
+
+def vendor_required(view):
+    return role_required("vendor")(view)
+
+
 def permission_required(permission):
     def decorator(view):
         @wraps(view)
         def wrapped(*args, **kwargs):
-            identity = current_identity()
+            identity = identity_from_session()
             if not identity:
                 return unauthorized()
             if identity["role"] == "super_admin" or permission in identity["permissions"]:
@@ -176,33 +209,24 @@ def permission_required(permission):
     return decorator
 
 
-def super_admin_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        identity = current_identity()
-        if not identity:
-            return unauthorized()
-        if identity["role"] != "super_admin":
-            return forbidden("Super Admin access is required.")
-        return view(*args, **kwargs)
-    return wrapped
-
-
-def login_user(user):
-    token = create_access_token(user)
+def create_session(user):
+    db = get_db()
+    session_id = secrets.token_urlsafe(32)
+    now = utc_now()
+    db.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
+    db.execute("INSERT INTO sessions (id, user_id, login_time, last_activity, ip_address) VALUES (?, ?, ?, ?, ?)", (session_id, user["id"], now, now, request.remote_addr or "unknown"))
+    db.commit()
     session.clear()
-    session.update(
-        user_id=user["id"], user_name=user["name"], role=user["role_name"],
-        is_admin=user["role_name"] in {"admin", "super_admin"}, access_token=token,
-    )
-    return token
+    session.permanent = True
+    session.update(user_id=user["id"], role=user["role_name"], session_id=session_id)
 
 
-def find_user(email):
-    return get_db().execute(
-        "SELECT users.*, roles.name AS role_name FROM users JOIN roles ON roles.id = users.role_id WHERE users.email = ?",
-        (email,),
-    ).fetchone()
+def destroy_session():
+    session_id = session.get("session_id")
+    if session_id:
+        get_db().execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        get_db().commit()
+    session.clear()
 
 
 def get_cart_items():
@@ -211,30 +235,28 @@ def get_cart_items():
         return []
     marks = ",".join("?" for _ in ids)
     return get_db().execute(
-        f"SELECT products.*, vendors.name AS vendor_name FROM products JOIN vendors ON vendors.id = products.vendor_id "
-        f"WHERE products.id IN ({marks}) AND products.status = 'approved' AND vendors.status = 'approved'", ids,
+        f"SELECT products.*, vendors.store_name AS vendor_name FROM products JOIN vendors ON vendors.id = products.vendor_id WHERE products.id IN ({marks}) AND products.status = 'approved' AND vendors.status = 'approved'",
+        ids,
     ).fetchall()
 
 
 @app.context_processor
 def shared_template_data():
-    identity = current_identity()
+    identity = identity_from_session()
     return {
         "cart_count": len(session.get("cart", [])),
-        "current_user": identity["user"]["name"] if identity else None,
+        "current_user": identity["user"]["username"] if identity else None,
         "current_role": identity["role"] if identity else None,
         "is_admin": bool(identity and identity["role"] in {"admin", "super_admin"}),
         "is_super_admin": bool(identity and identity["role"] == "super_admin"),
         "is_vendor": bool(identity and identity["role"] == "vendor"),
+        "permissions": sorted(identity["permissions"]) if identity else [],
     }
 
 
 @app.route("/")
 def home():
-    products = get_db().execute(
-        "SELECT products.*, vendors.name AS vendor_name FROM products JOIN vendors ON vendors.id = products.vendor_id "
-        "WHERE products.status = 'approved' AND vendors.status = 'approved' ORDER BY products.id DESC"
-    ).fetchall()
+    products = get_db().execute("SELECT products.*, vendors.store_name AS vendor_name FROM products JOIN vendors ON vendors.id = products.vendor_id WHERE products.status = 'approved' AND vendors.status = 'approved' ORDER BY products.id DESC").fetchall()
     return render_template("index.html", products=products)
 
 
@@ -242,36 +264,32 @@ def home():
 def auth():
     if request.method == "POST":
         action = request.form.get("action")
-        name = request.form.get("name", "").strip()
+        username = request.form.get("name", "").strip()
         email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
-        if not email or not password or (action == "register" and not name):
+        if not email or not password or (action == "register" and not username):
             flash("Please complete all required fields.", "error")
             return render_template("auth.html")
         db = get_db()
         if action == "register":
             try:
-                cursor = db.execute(
-                    "INSERT INTO users (name, email, password, role_id, status) VALUES (?, ?, ?, ?, 'active')",
-                    (name, email, generate_password_hash(password), role_id("customer")),
-                )
+                cursor = db.execute("INSERT INTO users (username, email, password_hash, role_id, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)", (username, email, generate_password_hash(password), role_id("customer"), utc_now()))
                 db.commit()
-                user = find_user(email)
-                login_user(user)
+                create_session(find_user(email))
                 flash("Account created. Welcome to Rijoya!", "success")
-                return redirect(url_for("home"))
+                return redirect(url_for("customer_dashboard"))
             except sqlite3.IntegrityError:
-                flash("That email is already registered.", "error")
+                flash("That email or username is already registered.", "error")
         else:
             user = find_user(email)
-            if user and user["status"] == "active" and check_password_hash(user["password"], password):
-                login_user(user)
+            if user and user["status"] == "active" and check_password_hash(user["password_hash"], password):
+                create_session(user)
                 flash("Welcome back!", "success")
                 if user["role_name"] in {"admin", "super_admin"}:
                     return redirect(url_for("admin_dashboard"))
                 if user["role_name"] == "vendor":
                     return redirect(url_for("vendor_dashboard"))
-                return redirect(url_for("home"))
+                return redirect(url_for("customer_dashboard"))
             flash("Email or password is incorrect, or this account is suspended.", "error")
     return render_template("auth.html")
 
@@ -279,25 +297,23 @@ def auth():
 @app.post("/api/auth/login")
 def api_login():
     data = request.get_json(silent=True) or request.form
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
-    user = find_user(email)
-    if not user or user["status"] != "active" or not check_password_hash(user["password"], password):
+    user = find_user(data.get("email", "").strip().lower())
+    if not user or user["status"] != "active" or not check_password_hash(user["password_hash"], data.get("password", "")):
         return jsonify(error="Invalid credentials"), 401
-    token = create_access_token(user)
-    return jsonify(access_token=token, token_type="Bearer", expires_in=JWT_EXPIRY_HOURS * 3600, role=user["role_name"])
+    create_session(user)
+    return jsonify(success=True, user_id=user["id"], role=user["role_name"], session_id=session["session_id"])
 
 
 @app.get("/api/auth/me")
-@auth_required
+@login_required
 def api_me():
-    identity = current_identity()
-    return jsonify(user=dict(identity["user"]), role=identity["role"], permissions=sorted(identity["permissions"]))
+    identity = identity_from_session()
+    return jsonify(user={"id": identity["user"]["id"], "username": identity["user"]["username"], "email": identity["user"]["email"]}, role=identity["role"], permissions=sorted(identity["permissions"]), last_login=identity["session"]["login_time"])
 
 
 @app.route("/logout")
 def logout():
-    session.clear()
+    destroy_session()
     flash("You have been logged out.", "success")
     return redirect(url_for("home"))
 
@@ -305,116 +321,32 @@ def logout():
 @app.route("/vendor/register", methods=["GET", "POST"])
 def vendor_register():
     if request.method == "POST":
-        name = request.form.get("name", "").strip()
+        store_name = request.form.get("name", "").strip()
         email = request.form.get("email", "").strip().lower()
-        password = request.form.get("password", "vendor123")
-        if not name or not email or not password:
-            flash("Shop name, email, and password are required.", "error")
+        password = request.form.get("password", "")
+        if not store_name or not email or not password:
+            flash("Store name, email, and password are required.", "error")
         else:
             try:
                 db = get_db()
-                user = current_identity()
-                if user and user["role"] not in {"customer", "vendor"}:
-                    return forbidden("Admin accounts cannot register as vendors.")
-                if user and user["role"] == "customer":
-                    return forbidden("Log out before creating a separate vendor account.")
-                cursor = db.execute(
-                    "INSERT INTO users (name, email, password, role_id, status) VALUES (?, ?, ?, ?, 'active')",
-                    (name, email, generate_password_hash(password), role_id("vendor")),
-                )
-                vendor_cursor = db.execute(
-                    "INSERT INTO vendors (name, email, products, status, owner_user_id) VALUES (?, ?, ?, 'pending', ?)",
-                    (name, email, "", cursor.lastrowid),
-                )
+                cursor = db.execute("INSERT INTO users (username, email, password_hash, role_id, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)", (store_name, email, generate_password_hash(password), role_id("vendor"), utc_now()))
+                db.execute("INSERT INTO vendors (user_id, store_name, email, status) VALUES (?, ?, ?, 'pending')", (cursor.lastrowid, store_name, email))
                 db.commit()
-                login_user(find_user(email))
-                session["vendor_id"] = vendor_cursor.lastrowid
-                session["vendor_name"] = name
-                flash("Application submitted. A Super Admin must approve your shop before it goes live.", "success")
+                create_session(find_user(email))
+                flash("Application submitted. A Super Admin must approve your store before it goes live.", "success")
                 return redirect(url_for("vendor_dashboard"))
             except sqlite3.IntegrityError:
-                flash("That vendor email is already registered.", "error")
+                flash("That vendor email or store name is already registered.", "error")
     return render_template("vendor_register.html")
-
-
-@app.route("/vendor/dashboard", methods=["GET", "POST"])
-@role_required("vendor")
-def vendor_dashboard():
-    identity = current_identity()
-    vendor = identity["vendor"]
-    if not vendor:
-        return forbidden("Your vendor profile is not set up.")
-    db = get_db()
-    if request.method == "POST":
-        name = request.form.get("name", "").strip()
-        price = request.form.get("price", "").strip()
-        if not name or not price:
-            flash("Product name and price are required.", "error")
-        else:
-            try:
-                db.execute("INSERT INTO products (name, price, vendor_id, status) VALUES (?, ?, ?, 'pending')", (name, float(price), vendor["id"]))
-                db.commit()
-                flash("Product submitted for approval.", "success")
-            except ValueError:
-                flash("Price must be a number.", "error")
-    products = db.execute("SELECT * FROM products WHERE vendor_id = ? ORDER BY id DESC", (vendor["id"],)).fetchall()
-    orders = db.execute(
-        "SELECT orders.*, products.name AS product_name, users.name AS customer_name FROM orders "
-        "JOIN products ON products.id = orders.product_id JOIN users ON users.id = orders.user_id "
-        "WHERE products.vendor_id = ? ORDER BY orders.id DESC", (vendor["id"],)
-    ).fetchall()
-    return render_template("vendor_dashboard.html", vendor=vendor, products=products, orders=orders)
-
-
-@app.post("/vendor/product/<int:product_id>/edit")
-@role_required("vendor")
-def vendor_product_edit(product_id):
-    vendor = current_identity()["vendor"]
-    try:
-        get_db().execute("UPDATE products SET name = ?, price = ?, status = 'pending' WHERE id = ? AND vendor_id = ?", (request.form.get("name", "").strip(), float(request.form.get("price", "")), product_id, vendor["id"]))
-        get_db().commit()
-        flash("Product updated and sent for approval again.", "success")
-    except ValueError:
-        flash("Price must be a number.", "error")
-    return redirect(url_for("vendor_dashboard") + "#products")
-
-
-@app.post("/vendor/product/<int:product_id>/delete")
-@role_required("vendor")
-def vendor_product_delete(product_id):
-    vendor = current_identity()["vendor"]
-    db = get_db()
-    db.execute("DELETE FROM orders WHERE product_id = ? AND product_id IN (SELECT id FROM products WHERE vendor_id = ?)", (product_id, vendor["id"]))
-    db.execute("DELETE FROM products WHERE id = ? AND vendor_id = ?", (product_id, vendor["id"]))
-    db.commit()
-    flash("Your product was deleted.", "success")
-    return redirect(url_for("vendor_dashboard") + "#products")
-
-
-@app.post("/vendor/order/<int:order_id>/status")
-@role_required("vendor")
-def vendor_order_status(order_id):
-    vendor = current_identity()["vendor"]
-    status = request.form.get("status")
-    if status not in {"processing", "shipped", "completed"}:
-        return forbidden("Vendors can only move orders to processing, shipped, or completed.")
-    get_db().execute("UPDATE orders SET status = ? WHERE id = ? AND product_id IN (SELECT id FROM products WHERE vendor_id = ?)", (status, order_id, vendor["id"]))
-    get_db().commit()
-    flash(f"Your order was marked {status}.", "success")
-    return redirect(url_for("vendor_dashboard") + "#orders")
 
 
 @app.route("/products", methods=["GET", "POST"])
 def products():
     if request.method == "POST":
-        identity = current_identity()
-        if not identity or identity["role"] != "vendor":
+        if not identity_from_session() or identity_from_session()["role"] != "vendor":
             return forbidden("Only vendors can add products from this page.")
         return redirect(url_for("vendor_dashboard"), code=307)
-    rows = get_db().execute(
-        "SELECT products.*, vendors.name AS vendor_name FROM products JOIN vendors ON vendors.id = products.vendor_id "
-        "WHERE products.status = 'approved' AND vendors.status = 'approved' ORDER BY products.id DESC"
-    ).fetchall()
+    rows = get_db().execute("SELECT products.*, vendors.store_name AS vendor_name FROM products JOIN vendors ON vendors.id = products.vendor_id WHERE products.status = 'approved' AND vendors.status = 'approved' ORDER BY products.id DESC").fetchall()
     return render_template("products.html", products=rows)
 
 
@@ -426,10 +358,7 @@ def cart():
 
 @app.post("/cart/add/<int:product_id>")
 def add_to_cart(product_id):
-    product = get_db().execute(
-        "SELECT products.id FROM products JOIN vendors ON vendors.id = products.vendor_id WHERE products.id = ? "
-        "AND products.status = 'approved' AND vendors.status = 'approved'", (product_id,)
-    ).fetchone()
+    product = get_db().execute("SELECT products.id FROM products JOIN vendors ON vendors.id = products.vendor_id WHERE products.id = ? AND products.status = 'approved' AND vendors.status = 'approved'", (product_id,)).fetchone()
     if not product:
         flash("Product is not available.", "error")
     else:
@@ -457,32 +386,115 @@ def checkout():
         return redirect(url_for("cart"))
     if request.method == "POST":
         db = get_db()
+        total = sum(item["price"] for item in items)
+        cursor = db.execute("INSERT INTO orders (customer_id, total_amount, status, created_at) VALUES (?, ?, 'confirmed', ?)", (current_user()["id"], total, utc_now()))
         for item in items:
-            db.execute("INSERT INTO orders (user_id, product_id, status) VALUES (?, ?, 'confirmed')", (current_identity()["user"]["id"], item["id"]))
+            db.execute("INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, 1, ?)", (cursor.lastrowid, item["id"], item["price"]))
         db.commit()
         session["cart"] = []
         flash("Order confirmed. Thank you for shopping with Rijoya!", "success")
-        return redirect(url_for("home"))
+        return redirect(url_for("customer_dashboard"))
     return render_template("checkout.html", items=items, total=sum(i["price"] for i in items))
 
 
+@app.route("/customer/dashboard")
+@role_required("customer")
+def customer_dashboard():
+    db = get_db()
+    user = current_user()
+    orders = db.execute("SELECT * FROM orders WHERE customer_id = ? ORDER BY id DESC", (user["id"],)).fetchall()
+    addresses = db.execute("SELECT * FROM addresses WHERE user_id = ? ORDER BY id DESC", (user["id"],)).fetchall()
+    return render_template("customer_dashboard.html", orders=orders, addresses=addresses, user=user)
+
+
+@app.post("/customer/address")
+@role_required("customer")
+def customer_address():
+    address = request.form.get("address", "").strip()
+    if address:
+        get_db().execute("INSERT INTO addresses (user_id, address, created_at) VALUES (?, ?, ?)", (current_user()["id"], address, utc_now()))
+        get_db().commit()
+        flash("Address saved.", "success")
+    return redirect(url_for("customer_dashboard"))
+
+
+@app.route("/vendor/dashboard", methods=["GET", "POST"])
+@vendor_required
+def vendor_dashboard():
+    identity = identity_from_session()
+    vendor = identity["vendor"]
+    db = get_db()
+    if not vendor:
+        return forbidden("Your vendor profile is not set up.")
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        price = request.form.get("price", "").strip()
+        if not name or not price:
+            flash("Product name and price are required.", "error")
+        else:
+            try:
+                db.execute("INSERT INTO products (name, price, vendor_id, status) VALUES (?, ?, ?, 'pending')", (name, float(price), vendor["id"]))
+                db.commit()
+                flash("Product submitted for approval.", "success")
+            except ValueError:
+                flash("Price must be a number.", "error")
+    products = db.execute("SELECT * FROM products WHERE vendor_id = ? ORDER BY id DESC", (vendor["id"],)).fetchall()
+    orders = db.execute("SELECT orders.id AS order_number, products.name AS product_name, order_items.quantity, order_items.price AS unit_price, (order_items.quantity * order_items.price) AS order_total, orders.status, orders.created_at FROM orders JOIN order_items ON order_items.order_id = orders.id JOIN products ON products.id = order_items.product_id WHERE products.vendor_id = ? ORDER BY orders.id DESC", (vendor["id"],)).fetchall()
+    earnings = db.execute("SELECT COALESCE(SUM(order_items.quantity * order_items.price), 0) FROM order_items JOIN products ON products.id = order_items.product_id WHERE products.vendor_id = ?", (vendor["id"],)).fetchone()[0]
+    return render_template("vendor_dashboard.html", vendor=vendor, products=products, orders=orders, earnings=earnings)
+
+
+@app.post("/vendor/product/<int:product_id>/edit")
+@vendor_required
+def vendor_product_edit(product_id):
+    vendor = identity_from_session()["vendor"]
+    try:
+        get_db().execute("UPDATE products SET name = ?, price = ?, status = 'pending' WHERE id = ? AND vendor_id = ?", (request.form.get("name", "").strip(), float(request.form.get("price", "")), product_id, vendor["id"]))
+        get_db().commit()
+        flash("Product updated and sent for approval again.", "success")
+    except ValueError:
+        flash("Price must be a number.", "error")
+    return redirect(url_for("vendor_dashboard") + "#products")
+
+
+@app.post("/vendor/product/<int:product_id>/delete")
+@vendor_required
+def vendor_product_delete(product_id):
+    vendor = identity_from_session()["vendor"]
+    db = get_db()
+    db.execute("DELETE FROM order_items WHERE product_id = ? AND product_id IN (SELECT id FROM products WHERE vendor_id = ?)", (product_id, vendor["id"]))
+    db.execute("DELETE FROM products WHERE id = ? AND vendor_id = ?", (product_id, vendor["id"]))
+    db.commit()
+    flash("Your product was deleted.", "success")
+    return redirect(url_for("vendor_dashboard") + "#products")
+
+
+@app.post("/vendor/order/<int:order_id>/status")
+@vendor_required
+def vendor_order_status(order_id):
+    vendor = identity_from_session()["vendor"]
+    status = request.form.get("status")
+    if status not in {"processing", "shipped", "completed"}:
+        return forbidden("Vendors can only move orders to processing, shipped, or completed.")
+    get_db().execute("UPDATE orders SET status = ? WHERE id = ? AND id IN (SELECT order_items.order_id FROM order_items JOIN products ON products.id = order_items.product_id WHERE products.vendor_id = ?)", (status, order_id, vendor["id"]))
+    get_db().commit()
+    flash(f"Your order was marked {status}.", "success")
+    return redirect(url_for("vendor_dashboard") + "#orders")
+
+
 @app.route("/admin")
-@permission_required("view_dashboard")
+@admin_required
 def admin_dashboard():
     db = get_db()
-    identity = current_identity()
-    vendors = db.execute("SELECT * FROM vendors ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC").fetchall()
-    products = db.execute("SELECT products.*, vendors.name AS vendor_name FROM products JOIN vendors ON vendors.id = products.vendor_id ORDER BY products.id DESC").fetchall()
-    orders = db.execute("SELECT orders.*, users.name AS customer_name, products.name AS product_name FROM orders JOIN users ON users.id = orders.user_id JOIN products ON products.id = orders.product_id ORDER BY orders.id DESC").fetchall()
+    identity = identity_from_session()
+    vendors = db.execute("SELECT vendors.*, users.email FROM vendors JOIN users ON users.id = vendors.user_id ORDER BY vendors.id DESC").fetchall()
+    products = db.execute("SELECT products.*, vendors.store_name AS vendor_name FROM products JOIN vendors ON vendors.id = products.vendor_id ORDER BY products.id DESC").fetchall()
+    orders = db.execute("SELECT orders.*, users.username AS customer_name FROM orders JOIN users ON users.id = orders.customer_id ORDER BY orders.id DESC").fetchall()
     admins = db.execute("SELECT users.*, roles.name AS role_name FROM users JOIN roles ON roles.id = users.role_id WHERE roles.name = 'admin' ORDER BY users.id DESC").fetchall()
-    stats = {
-        "vendors": db.execute("SELECT COUNT(*) FROM vendors").fetchone()[0],
-        "pending_vendors": db.execute("SELECT COUNT(*) FROM vendors WHERE status = 'pending'").fetchone()[0],
-        "products": db.execute("SELECT COUNT(*) FROM products").fetchone()[0],
-        "pending_products": db.execute("SELECT COUNT(*) FROM products WHERE status = 'pending'").fetchone()[0],
-        "orders": db.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
-    }
-    return render_template("admin.html", vendors=vendors, products=products, orders=orders, admins=admins, stats=stats, permissions=sorted(identity["permissions"]))
+    customers = db.execute("SELECT users.* FROM users JOIN roles ON roles.id = users.role_id WHERE roles.name = 'customer' ORDER BY users.id DESC").fetchall()
+    stats = {"users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0], "vendors": db.execute("SELECT COUNT(*) FROM vendors").fetchone()[0], "products": db.execute("SELECT COUNT(*) FROM products").fetchone()[0], "orders": db.execute("SELECT COUNT(*) FROM orders").fetchone()[0], "sales": db.execute("SELECT COALESCE(SUM(total_amount), 0) FROM orders").fetchone()[0]}
+    tickets = db.execute("SELECT support_tickets.*, users.username FROM support_tickets JOIN users ON users.id = support_tickets.user_id ORDER BY support_tickets.id DESC").fetchall()
+    return render_template("admin.html", vendors=vendors, products=products, orders=orders, admins=admins, customers=customers, stats=stats, permissions=sorted(identity["permissions"]), tickets=tickets)
 
 
 @app.post("/admin/admin/create")
@@ -491,11 +503,11 @@ def admin_create():
     data = request.form
     try:
         db = get_db()
-        db.execute("INSERT INTO users (name, email, password, role_id, status) VALUES (?, ?, ?, ?, 'active')", (data.get("name", "").strip(), data.get("email", "").strip().lower(), generate_password_hash(data.get("password", "")), role_id("admin")))
+        db.execute("INSERT INTO users (username, email, password_hash, role_id, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)", (data.get("name", "").strip(), data.get("email", "").strip().lower(), generate_password_hash(data.get("password", "")), role_id("admin"), utc_now()))
         db.commit()
         flash("Admin account created.", "success")
     except sqlite3.IntegrityError:
-        flash("That admin email is already in use.", "error")
+        flash("That admin email or username is already in use.", "error")
     return redirect(url_for("admin_dashboard") + "#admins")
 
 
@@ -503,11 +515,11 @@ def admin_create():
 @super_admin_required
 def admin_edit(user_id):
     try:
-        get_db().execute("UPDATE users SET name = ?, email = ? WHERE id = ? AND role_id = ?", (request.form.get("name", "").strip(), request.form.get("email", "").strip().lower(), user_id, role_id("admin")))
+        get_db().execute("UPDATE users SET username = ?, email = ? WHERE id = ? AND role_id = ?", (request.form.get("name", "").strip(), request.form.get("email", "").strip().lower(), user_id, role_id("admin")))
         get_db().commit()
         flash("Admin account updated.", "success")
     except sqlite3.IntegrityError:
-        flash("That admin email is already in use.", "error")
+        flash("That admin email or username is already in use.", "error")
     return redirect(url_for("admin_dashboard") + "#admins")
 
 
@@ -542,7 +554,7 @@ def admin_permissions(user_id):
     for permission in request.form.getlist("permissions"):
         row = db.execute("SELECT id FROM permissions WHERE name = ?", (permission,)).fetchone()
         if row:
-            db.execute("INSERT INTO user_permissions (user_id, permission_id) VALUES (?, ?)", (user_id, row["id"]))
+            db.execute("INSERT OR IGNORE INTO user_permissions (user_id, permission_id) VALUES (?, ?)", (user_id, row["id"]))
     db.commit()
     flash("Admin permissions updated.", "success")
     return redirect(url_for("admin_dashboard") + "#admins")
@@ -564,11 +576,11 @@ def admin_vendor_status(vendor_id):
 @permission_required("manage_vendors")
 def admin_vendor_edit(vendor_id):
     try:
-        get_db().execute("UPDATE vendors SET name = ?, email = ? WHERE id = ?", (request.form.get("name", "").strip(), request.form.get("email", "").strip().lower(), vendor_id))
+        get_db().execute("UPDATE vendors SET store_name = ? WHERE id = ?", (request.form.get("name", "").strip(), vendor_id))
         get_db().commit()
         flash("Vendor updated.", "success")
     except sqlite3.IntegrityError:
-        flash("That vendor email is already in use.", "error")
+        flash("That vendor name is already in use.", "error")
     return redirect(url_for("admin_dashboard") + "#vendors")
 
 
@@ -576,9 +588,7 @@ def admin_vendor_edit(vendor_id):
 @permission_required("manage_vendors")
 def admin_vendor_delete(vendor_id):
     db = get_db()
-    product_ids = [row[0] for row in db.execute("SELECT id FROM products WHERE vendor_id = ?", (vendor_id,)).fetchall()]
-    for product_id in product_ids:
-        db.execute("DELETE FROM orders WHERE product_id = ?", (product_id,))
+    db.execute("DELETE FROM order_items WHERE product_id IN (SELECT id FROM products WHERE vendor_id = ?)", (vendor_id,))
     db.execute("DELETE FROM products WHERE vendor_id = ?", (vendor_id,))
     db.execute("DELETE FROM vendors WHERE id = ?", (vendor_id,))
     db.commit()
@@ -614,7 +624,7 @@ def admin_product_edit(product_id):
 @permission_required("manage_products")
 def admin_product_delete(product_id):
     db = get_db()
-    db.execute("DELETE FROM orders WHERE product_id = ?", (product_id,))
+    db.execute("DELETE FROM order_items WHERE product_id = ?", (product_id,))
     db.execute("DELETE FROM products WHERE id = ?", (product_id,))
     db.commit()
     flash("Product deleted.", "success")
@@ -631,6 +641,18 @@ def admin_order_status(order_id):
     get_db().commit()
     flash(f"Order marked {status}.", "success")
     return redirect(url_for("admin_dashboard") + "#orders")
+
+
+@app.post("/admin/support/<int:ticket_id>/status")
+@permission_required("manage_support")
+def admin_support_status(ticket_id):
+    status = request.form.get("status")
+    if status not in {"open", "in_progress", "closed"}:
+        return forbidden("Invalid support status.")
+    get_db().execute("UPDATE support_tickets SET status = ? WHERE id = ?", (status, ticket_id))
+    get_db().commit()
+    flash("Support ticket updated.", "success")
+    return redirect(url_for("admin_dashboard") + "#support")
 
 
 @app.cli.command("init-db")
