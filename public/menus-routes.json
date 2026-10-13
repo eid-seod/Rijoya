@@ -1,0 +1,36 @@
+{
+  "storefront": [
+    {"label": "الصفحة الرئيسية", "path": "/"},
+    {"label": "كل المنتجات", "path": "/products"},
+    {"label": "السلة", "path": "/cart"},
+    {"label": "إتمام الطلب", "path": "/checkout"},
+    {"label": "حسابي", "path": "/account"}
+  ],
+  "auth": [
+    {"label": "تسجيل الدخول", "path": "/login"},
+    {"label": "إنشاء حساب", "path": "/register"},
+    {"label": "استعادة كلمة المرور", "path": "/forgot-password"}
+  ],
+  "admin": [
+    {"label": "لوحة الإدارة", "path": "/admin/"},
+    {"label": "المنتجات", "path": "/admin/products"},
+    {"label": "التصنيفات", "path": "/admin/categories"},
+    {"label": "الطلبات", "path": "/admin/orders"},
+    {"label": "أسعار التوصيل", "path": "/admin/shipping"},
+    {"label": "تصدير العملاء", "path": "/admin/customers.csv"}
+  ],
+  "api": [
+    {"label": "قائمة المنتجات", "path": "/api/products", "method": "GET"},
+    {"label": "تفاصيل منتج", "path": "/api/products/{slug}", "method": "GET"},
+    {"label": "قائمة التصنيفات", "path": "/api/categories", "method": "GET"},
+    {"label": "تفاصيل تصنيف ومنتجاته", "path": "/api/categories/{slug}", "method": "GET"},
+    {"label": "قائمة منتجات الإدارة", "path": "/api/admin/products", "method": "GET", "auth": "admin"},
+    {"label": "إنشاء منتج", "path": "/api/admin/products", "method": "POST", "auth": "admin", "csrf": true},
+    {"label": "تحديث أو إخفاء منتج", "path": "/api/admin/products/{id}", "methods": ["GET", "PATCH", "PUT", "DELETE"], "auth": "admin", "csrf": true},
+    {"label": "قائمة تصنيفات الإدارة", "path": "/api/admin/categories", "method": "GET", "auth": "admin"},
+    {"label": "إنشاء تصنيف", "path": "/api/admin/categories", "method": "POST", "auth": "admin", "csrf": true},
+    {"label": "تحديث أو إخفاء تصنيف", "path": "/api/admin/categories/{id}", "methods": ["GET", "PATCH", "PUT", "DELETE"], "auth": "admin", "csrf": true},
+    {"label": "قراءة السلة", "path": "/api/cart", "method": "GET"},
+    {"label": "تحديث السلة", "path": "/api/cart", "method": "POST", "csrf": true}
+  ]
+}

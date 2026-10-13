@@ -1,0 +1,7 @@
+<article class="product-card">
+  <a class="product-visual" href="{{ url_for('shop.product_detail', slug=product.slug) }}">
+    {% if product.image %}<img src="{{ url_for('static', filename='uploads/' + product.image) }}" alt="{{ product.name }}" loading="lazy">{% else %}<div class="product-art art-{{ product.id % 5 }}"><span class="art-monogram">{{ product.name[:1] }}</span><span class="art-caption">اختيار ريجويا</span></div>{% endif %}
+    {% if product.on_sale %}<span class="sale-badge">عرض خاص</span>{% elif product.is_featured %}<span class="feature-badge">اختيارنا</span>{% endif %}
+  </a>
+  <div class="product-info">{% if product.category %}<a class="product-category" href="{{ url_for('shop.products', category=product.category.slug) }}">{{ product.category.name }}</a>{% endif %}<h3><a href="{{ url_for('shop.product_detail', slug=product.slug) }}">{{ product.name }}</a></h3><div class="product-bottom"><div class="price-line"><strong>{{ '%.0f'|format(product.price) }} <small>ج.م</small></strong>{% if product.on_sale %}<del>{{ '%.0f'|format(product.compare_at_price) }}</del>{% endif %}</div><form method="post" action="{{ url_for('shop.add_to_cart', product_id=product.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="quantity" value="1"><button class="quick-add" {% if product.stock < 1 %}disabled{% endif %} aria-label="أضف {{ product.name }} إلى السلة">{% if product.stock > 0 %}+{% else %}نفد{% endif %}</button></form></div></div>
+</article>
